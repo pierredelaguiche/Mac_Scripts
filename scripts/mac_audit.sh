@@ -14,17 +14,42 @@
 #     <repo>/outputs/ for the weekly Claude maintenance task)
 #
 # SCOPE — "non-factory modifications"
-#   [1] security posture        [2] software inventory (+ pkg receipts)
+#   [1] security posture (+ sealed root, XProtect, update config, auto-login)
+#   [2] software inventory (+ pkg receipts)
 #   [3] unused apps             [4] local AI tools (CVE checks)
-#   [5] suspicious artifacts    [6] data collectors
-#   [7] TCC permissions         [8] LaunchAgents/Daemons (+ malware IOCs)
-#   [9] other persistence (login items, cron, at, hooks, legacy startup)
-#   [10] system modifications (/etc, kexts, system extensions, profiles,
-#        users, root CAs, shell rc files, /usr/local & /opt)
-#   [11] app extensions & plug-ins (pluginkit, browser extensions,
-#        QuickLook/Spotlight/PreferencePanes/etc.)
-#   [12] network configuration (proxies, DNS, VPN, remote access services)
-#   [13] outbound connections   [14] disk usage   [15] summary
+#   [5] suspicious artifacts (home, ~/Library hidden entries, /Users/Shared,
+#       executables staged in tmp dirs)
+#   [6] data collectors
+#   [7] TCC permissions (user AND system TCC.db)
+#   [8] LaunchAgents/Daemons (+ malware IOCs, program signature, missing
+#       binaries, root-run programs writable by non-root = privesc)
+#   [9] other persistence (login items, BTM, cron, at, hooks, periodic,
+#       authorization plugins, legacy startup)
+#   [10] system modifications (/etc, system-wide shell files, PATH, sudoers,
+#        kexts, system extensions, profiles, root CAs, shell rc files)
+#   [11] root & privilege surface (/ top level, SUID/SGID, privileged helper
+#        tools, world-writable system paths, /var/root)
+#   [12] user accounts & home (UID-0 clones, shell-bearing system accounts,
+#        guest/auto-login, remote logins, SSH keys, credential files,
+#        home permissions, files in home not owned by you)
+#   [13] app extensions & plug-ins (pluginkit, browser extensions,
+#        QuickLook/Spotlight/PreferencePanes/Frameworks/etc.)
+#   [14] Library leftovers (orphaned Containers / Saved State / prefs of
+#        uninstalled apps)
+#   [15] network configuration (proxies, DNS, VPN, remote access services,
+#        firewall allow-list)
+#   [16] outbound connections   [17] disk usage (+ ~/Library, /Library,
+#        dev caches, snapshots, files >1 GB)   [18] summary
+#
+# PRIVILEGE LEVELS
+#   Plain run: everything a normal user can see. Recommended.
+#   sudo run (sudo bash scripts/mac_audit.sh): adds root-only checks —
+#     sfltool dumpbtm, /var/root, all users' crontabs/LaunchAgents/SSH keys,
+#     sudoers NOPASSWD rules, system-level profiles. User-context commands
+#     (brew, login items, crontab, trust settings) still run as the invoking
+#     user via sudo -u; reports are chowned back to that user.
+#     --quarantine is refused under sudo (it must never move files as root).
+#   Full Disk Access for Terminal: unlocks TCC databases and Library sizes.
 #
 # SAFETY MODEL
 #   - Default run is 100% read-only. No file is ever moved or deleted.
@@ -51,6 +76,26 @@ set -uo pipefail
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 ESC=$(printf '\033')
+
+# ---------- privilege context ----------
+# Under sudo, $HOME may be /var/root (macOS sudo does not always keep HOME).
+# Resolve the invoking user's real home so every user-domain check still
+# audits that user, not root.
+IS_ROOT=false
+[ "$(id -u)" -eq 0 ] && IS_ROOT=true
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+if [ "$IS_ROOT" = true ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  _TH=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -n "$_TH" ] && [ -d "$_TH" ] && HOME="$_TH"
+fi
+# Run a command as the audited user (no-op when not under sudo).
+as_user() {
+  if [ "$IS_ROOT" = true ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    sudo -u "$SUDO_USER" -H "$@"
+  else
+    "$@"
+  fi
+}
 
 AUDIT_DIR="$HOME/.mac_audit"
 QUARANTINE_DIR="$AUDIT_DIR/quarantine"
@@ -102,10 +147,68 @@ section() {
   md ""
   md "## $SECTION_NUM. $1"
   md ""
+  # Open the fence HERE, in the parent shell. Many log() calls run inside
+  # `cmd | while` subshells; if the first log of a section ran in one, the
+  # fence was opened in the file but MD_FENCE_OPEN stayed false in the parent,
+  # so the next section() never closed it and the headings rendered as code.
+  [ "${2:-}" = "nofence" ] || md_open_fence
 }
 
 json_escape() { printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 note_mod() { NONFACTORY+=("$1"); }
+
+# ---------- inspection helpers ----------
+# Signature summary for a binary/bundle: "signed: <first Authority>",
+# "ad-hoc", "UNSIGNED", or "MISSING".
+sig_status() {
+  local f="$1" info auth
+  [ -e "$f" ] || { echo "MISSING"; return; }
+  info=$(codesign -dv --verbose=2 "$f" 2>&1)
+  if echo "$info" | grep -q "not signed at all"; then echo "UNSIGNED"; return; fi
+  if echo "$info" | grep -q "Signature=adhoc"; then echo "ad-hoc"; return; fi
+  auth=$(echo "$info" | sed -n 's/^Authority=//p' | head -1)
+  if [ -n "$auth" ]; then echo "signed: $auth"; else echo "UNSIGNED"; fi
+}
+# Shell-startup red flags: pipe-a-download-to-shell, base64-decoded eval,
+# dylib injection. Shared by every rc-file scan (user, /etc, /var/root, others).
+SUS_RC_RE='(curl|wget)[^|;]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|/bin/)?sh|eval[[:space:]].*base64|base64[[:space:]]+(-d|-D|--decode)[^|]*\|[[:space:]]*(ba|z)?sh|DYLD_INSERT_LIBRARIES'
+# Permission bits as octal digits; 0 if unreadable/garbled (keeps $((8#…)) safe).
+perm_of() {
+  local m
+  m=$(stat -f "%Lp" "$1" 2>/dev/null)
+  case "$m" in ''|*[!0-7]*) echo 0 ;; *) echo "$m" ;; esac
+}
+is_macho() { file -b "$1" 2>/dev/null | grep -q "Mach-O"; }
+# Octal permission bits → true if writable by someone other than root.
+# Owner not root, other-writable, or group-writable with a non-wheel group.
+writable_by_nonroot() {
+  local f="$1" owner group mode
+  [ -e "$f" ] || return 1
+  owner=$(stat -f "%Su" "$f" 2>/dev/null); group=$(stat -f "%Sg" "$f" 2>/dev/null)
+  mode=$(perm_of "$f"); mode=${mode:-0}
+  [ "$owner" != "root" ] && return 0
+  [ $(( 8#$mode & 2 )) -ne 0 ] && return 0
+  [ $(( 8#$mode & 16 )) -ne 0 ] && [ "$group" != "wheel" ] && return 0
+  return 1
+}
+# Suspicious place for an executable that runs automatically.
+suspicious_location() {
+  case "$1" in
+    # well-known dev toolchain dot-dirs are hidden but normal
+    */.local/*|*/.cargo/*|*/.nvm/*|*/.pyenv/*|*/.volta/*|*/.bun/*|*/.deno/*|*/.rbenv/*|*/.asdf/*|*/.orbstack/*|*/.docker/*) return 1 ;;
+    /tmp/*|/private/tmp/*|/private/var/tmp/*|/var/tmp/*|/Users/Shared/*) return 0 ;;
+    */.[!.]*/*|*/.[!.]*) return 0 ;;   # any hidden path component
+  esac
+  return 1
+}
+
+# ---------- Full Disk Access probe ----------
+# `[ -r TCC.db ]` only checks POSIX bits (always true); TCC blocks the actual
+# open. Reading one byte is the real test.
+USER_TCC_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+SYS_TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+HAS_FDA=false
+head -c1 "$USER_TCC_DB" >/dev/null 2>&1 && HAS_FDA=true
 
 # ============================================================
 # MODE: --purge-quarantine — the only path that actually deletes
@@ -132,6 +235,22 @@ fi
 
 QUARANTINE_MODE=false
 [ "${1:-}" = "--quarantine" ] && QUARANTINE_MODE=true
+if [ "$QUARANTINE_MODE" = true ] && [ "$IS_ROOT" = true ]; then
+  echo -e "${RED}--quarantine refuses to run under sudo${RESET} (moving files as root can"
+  echo "grab root-owned items and leaves root-owned files in your home)."
+  echo "Run the sudo pass read-only, then run --quarantine as yourself."
+  exit 1
+fi
+
+# Under sudo, hand every file this run creates back to the audited user,
+# even if the run is interrupted.
+if [ "$IS_ROOT" = true ] && [ "$TARGET_USER" != "root" ]; then
+  trap 'chown -R "$TARGET_USER" "$AUDIT_DIR" 2>/dev/null; chown "$TARGET_USER" "$MD_REPORT" "$OUT_DIR/inventory.json" 2>/dev/null' EXIT
+fi
+
+PRIV_DESC="user ($TARGET_USER)"
+[ "$IS_ROOT" = true ] && PRIV_DESC="root via sudo — auditing user $TARGET_USER + root-only checks"
+FDA_DESC=$([ "$HAS_FDA" = true ] && echo "yes" || echo "no (TCC + Library sizes limited)")
 
 echo "" > "$REPORT"
 MACOS_VER="$(sw_vers -productVersion 2>/dev/null)"
@@ -145,6 +264,8 @@ HOSTNAME_HR="$(scutil --get ComputerName 2>/dev/null || hostname)"
   echo "| Host | $HOSTNAME_HR |"
   echo "| macOS | ${MACOS_VER:-unknown} (${MACOS_BUILD:-?}) |"
   echo "| Mode | $([ "$QUARANTINE_MODE" = true ] && echo "QUARANTINE (moves junk after confirmation, never deletes)" || echo "READ-ONLY (nothing touched)") |"
+  echo "| Privileges | $PRIV_DESC |"
+  echo "| Full Disk Access | $FDA_DESC |"
   echo "| Text report | \`$REPORT\` |"
 } > "$MD_REPORT"
 
@@ -154,6 +275,9 @@ logt "Host  : $HOSTNAME_HR — macOS ${MACOS_VER:-unknown} (${MACOS_BUILD:-?})"
 logt "Report: $REPORT"
 logt "MD    : $MD_REPORT"
 logt "Mode  : $([ "$QUARANTINE_MODE" = true ] && echo "QUARANTINE (will offer to move junk, never deletes)" || echo "READ-ONLY (nothing will be touched)")"
+logt "Privs : $PRIV_DESC"
+logt "FDA   : $FDA_DESC"
+[ "$IS_ROOT" = false ] && logt "        (tip: 'sudo bash $0' adds root-only checks: BTM, /var/root, all users, sudoers)"
 
 # ============================================================
 # [1] SYSTEM SECURITY POSTURE
@@ -177,6 +301,73 @@ log "  Firewall stealth mode: $(echo "$STEALTH" | grep -qi "enabled" && echo "${
 
 ROOT_ENABLED=$(dscl . -read /Users/root AuthenticationAuthority 2>/dev/null)
 log "  Root account: $([ -n "$ROOT_ENABLED" ] && echo "${RED}ENABLED — disable unless you specifically need it${RESET}" || echo "${GREEN}disabled (default)${RESET}")"
+[ -n "$ROOT_ENABLED" ] && REVIEW_ONLY+=("Root account is enabled (dsenableroot -d to disable)")
+
+# Sealed System Volume: with authenticated-root disabled the system volume
+# can be modified and booted unsealed — only ever done deliberately.
+AUTHROOT=$(csrutil authenticated-root status 2>/dev/null | grep -o "enabled\|disabled")
+if [ -n "$AUTHROOT" ]; then
+  log "  Sealed system volume (authenticated root): $([ "$AUTHROOT" = "enabled" ] && echo "${GREEN}enabled${RESET}" || echo "${RED}disabled${RESET}")"
+  [ "$AUTHROOT" = "disabled" ] && REVIEW_ONLY+=("Authenticated root (sealed system volume) is DISABLED")
+fi
+[ "$SIP" = "disabled" ] && REVIEW_ONLY+=("SIP is disabled")
+echo "$GATEKEEPER" | grep -q "assessments enabled" || REVIEW_ONLY+=("Gatekeeper is not enabled")
+
+# XProtect: Apple's built-in signature AV. Updates arrive silently via
+# "Install Security Responses and system files" (ConfigDataInstall).
+XP_PLIST="/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist"
+XP_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$XP_PLIST" 2>/dev/null)
+XP_DATE=$(stat -f "%Sm" -t "%Y-%m-%d" "$XP_PLIST" 2>/dev/null)
+log "  XProtect definitions: ${XP_VER:-unknown}${XP_DATE:+ (updated $XP_DATE)}"
+if [ -n "$XP_DATE" ]; then
+  XP_AGE=$(( ( $(date +%s) - $(date -j -f "%Y-%m-%d" "$XP_DATE" +%s 2>/dev/null || date +%s) ) / 86400 ))
+  if [ "$XP_AGE" -gt 60 ]; then
+    log "    ${YELLOW}XProtect not updated in ${XP_AGE} days — check automatic security updates below.${RESET}"
+    REVIEW_ONLY+=("XProtect definitions ${XP_AGE} days old")
+  fi
+fi
+
+log "  Automatic update settings (unset = Apple default, on):"
+SU_PREFS="/Library/Preferences/com.apple.SoftwareUpdate"
+for KEY in AutomaticCheckEnabled AutomaticDownload CriticalUpdateInstall ConfigDataInstall AutomaticallyInstallMacOSUpdates; do
+  VAL=$(defaults read "$SU_PREFS" "$KEY" 2>/dev/null)
+  case "$VAL" in
+    1) log "    $KEY: ${GREEN}on${RESET}" ;;
+    0) if [ "$KEY" = "CriticalUpdateInstall" ] || [ "$KEY" = "ConfigDataInstall" ]; then
+         log "    $KEY: ${RED}OFF — security responses / XProtect updates will not install automatically${RESET}"
+         REVIEW_ONLY+=("Software Update $KEY is off (security data not auto-installed)")
+       else
+         log "    $KEY: ${YELLOW}off${RESET}"
+       fi ;;
+    *) log "    $KEY: default" ;;
+  esac
+done
+
+# Auto-login defeats FileVault's pre-boot auth on the login window and
+# stores the password XOR-obfuscated (trivially reversible) in /etc/kcpassword.
+AUTOLOGIN=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)
+if [ -n "$AUTOLOGIN" ] || [ -e /etc/kcpassword ]; then
+  log "  Automatic login: ${RED}ENABLED${AUTOLOGIN:+ for $AUTOLOGIN}${RESET}$([ -e /etc/kcpassword ] && echo " — /etc/kcpassword present (reversibly obfuscated password)")"
+  REVIEW_ONLY+=("Automatic login enabled${AUTOLOGIN:+ ($AUTOLOGIN)}; /etc/kcpassword $([ -e /etc/kcpassword ] && echo present || echo absent)")
+else
+  log "  Automatic login: ${GREEN}disabled${RESET}"
+fi
+GUEST=$(defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null)
+log "  Guest account: $([ "$GUEST" = "1" ] && echo "${YELLOW}enabled${RESET}" || echo "${GREEN}disabled${RESET}")"
+[ "$GUEST" = "1" ] && note_mod "Guest account enabled"
+
+SCREENLOCK=$(as_user sysadminctl -screenLock status 2>&1 | sed -n 's/.*\(screenLock.*\)/\1/p' | head -1)
+[ -n "$SCREENLOCK" ] && log "  Screen lock: $SCREENLOCK"
+LDM=$(as_user defaults read .GlobalPreferences LDMGlobalEnabled 2>/dev/null)
+log "  Lockdown Mode: $([ "$LDM" = "1" ] && echo "on" || echo "off (default)")"
+
+# DYLD_INSERT_LIBRARIES in launchd's environment injects a dylib into every
+# process launched afterwards in that domain — pure red flag.
+LD_DYLD=$(as_user launchctl getenv DYLD_INSERT_LIBRARIES 2>/dev/null)
+if [ -n "$LD_DYLD" ]; then
+  log "  ${RED}[INJECTION]${RESET} launchd environment has DYLD_INSERT_LIBRARIES=$LD_DYLD"
+  REVIEW_ONLY+=("launchd DYLD_INSERT_LIBRARIES set: $LD_DYLD")
+fi
 
 SOFTWARE_UPDATE_AGE=$(softwareupdate --history 2>/dev/null | tail -2 | head -1)
 log "  Last installed system update: ${SOFTWARE_UPDATE_AGE:-unknown}"
@@ -217,7 +408,7 @@ echo "" >> "$INVENTORY"; echo "  ]," >> "$INVENTORY"
 log "\n  ${BOLD}Homebrew:${RESET}"
 echo "  \"homebrew_outdated\": [" >> "$INVENTORY"
 if command -v brew >/dev/null 2>&1; then
-  OUTDATED=$(brew outdated 2>/dev/null)
+  OUTDATED=$(as_user "$(command -v brew)" outdated 2>/dev/null)
   if [ -n "$OUTDATED" ]; then
     log "    ${YELLOW}Outdated formulae/casks:${RESET}"
     echo "$OUTDATED" | while read -r LINE; do log "      $LINE"; done
@@ -232,14 +423,14 @@ echo "" >> "$INVENTORY"; echo "  ]," >> "$INVENTORY"
 
 log "\n  ${BOLD}Mac App Store (via 'mas', if installed):${RESET}"
 if command -v mas >/dev/null 2>&1; then
-  mas outdated 2>/dev/null | while read -r LINE; do log "    ${YELLOW}[OUTDATED]${RESET} $LINE"; done
+  as_user "$(command -v mas)" outdated 2>/dev/null | while read -r LINE; do log "    ${YELLOW}[OUTDATED]${RESET} $LINE"; done
 else
   log "    'mas' CLI not installed — skip (install with: brew install mas)"
 fi
 
 log "\n  ${BOLD}Global pip / npm packages (extra attack surface):${RESET}"
-command -v pip3 >/dev/null 2>&1 && pip3 list --user 2>/dev/null | tail -n +3 | while read -r LINE; do log "    [pip --user] $LINE"; done
-command -v npm  >/dev/null 2>&1 && npm list -g --depth=0 2>/dev/null | tail -n +2 | \
+command -v pip3 >/dev/null 2>&1 && as_user "$(command -v pip3)" list --user 2>/dev/null | tail -n +3 | while read -r LINE; do log "    [pip --user] $LINE"; done
+command -v npm  >/dev/null 2>&1 && as_user "$(command -v npm)" list -g --depth=0 2>/dev/null | tail -n +2 | \
   sed 's/^[^A-Za-z0-9@]*//' | grep -v '^ *$' | while read -r LINE; do log "    [npm -g] $LINE"; done
 
 # Installer receipts: everything ever installed via .pkg that isn't Apple's.
@@ -389,10 +580,15 @@ log "\n  Listening ports bound to non-localhost (potential remote exposure of lo
 # check exists to catch. The filter was inverted: it hid real exposures and the
 # check could never fire for the most common misconfiguration. Now only loopback
 # binds (127.0.0.1, ::1, localhost) are excluded.
-lsof -i -n -P 2>/dev/null | grep LISTEN | awk '{print $1, $9}' | sort -u | \
-grep -v "127\.0\.0\.1\|\[::1\]\|localhost" | while read -r LINE; do
+# Process substitution (not a pipe) so exposures reach the summary.
+EXPOSED_N=0
+while IFS= read -r LINE; do
+  [ -z "$LINE" ] && continue
+  EXPOSED_N=$((EXPOSED_N + 1))
   log "    ${RED}[EXPOSED?]${RESET} $LINE"
-done
+done < <(lsof -i -n -P 2>/dev/null | grep LISTEN | awk '{print $1, $9}' | sort -u | grep -v "127\.0\.0\.1\|\[::1\]\|localhost")
+[ "$EXPOSED_N" -gt 0 ] && REVIEW_ONLY+=("$EXPOSED_N listening socket(s) bound beyond localhost (section 4) — confirm each is meant to be reachable")
+[ "$IS_ROOT" = false ] && log "  (Only your own processes are visible; the sudo run lists every listener.)"
 log "  (If this list is non-empty, confirm each one is meant to be reachable from outside this Mac.)"
 
 # ============================================================
@@ -480,6 +676,49 @@ for IDX in "${!SUSPICIOUS_LIB_PATHS[@]}"; do
   fi
 done
 
+# Hidden (dot-prefixed) entries in Library dirs: legitimate software almost
+# never hides there; AdLoad/Atomic/Poseidon-style stealers routinely do
+# (e.g. ~/Library/Application Support/.<random>/).
+log "\n  ${BOLD}Hidden entries in Library folders (should be none besides .DS_Store/.localized):${RESET}"
+HIDDEN_LIB_FOUND=false
+for LBASE in "$HOME/Library" "$HOME/Library/Application Support" "$HOME/Library/LaunchAgents" \
+             "/Library" "/Library/Application Support" "/Library/LaunchAgents" "/Library/LaunchDaemons"; do
+  [ -d "$LBASE" ] || continue
+  while IFS= read -r HE; do
+    [ -z "$HE" ] && continue
+    HIDDEN_LIB_FOUND=true
+    HP="$LBASE/$HE"
+    log "    ${YELLOW}[HIDDEN]${RESET} $HP ($(stat -f "%Su, modified %Sm" -t "%Y-%m-%d" "$HP" 2>/dev/null))"
+    REVIEW_ONLY+=("Hidden entry in Library: $HP")
+  done < <(ls -A "$LBASE" 2>/dev/null | grep '^\.' | grep -vE '^\.(DS_Store|localized|com\.apple\.timemachine\.supported)$')
+done
+[ "$HIDDEN_LIB_FOUND" = false ] && log "    None."
+
+# /Users/Shared is world-writable and survives across accounts — a classic
+# drop zone for payloads and cross-user persistence.
+log "\n  ${BOLD}/Users/Shared (world-writable drop zone):${RESET}"
+SHARED_LIST=$(ls -A /Users/Shared 2>/dev/null | grep -vE '^\.(localized|DS_Store)$')
+if [ -n "$SHARED_LIST" ]; then
+  echo "$SHARED_LIST" | while IFS= read -r I; do log "    $I"; done
+  note_mod "/Users/Shared contains $(echo "$SHARED_LIST" | wc -l | tr -d ' ') item(s)"
+else
+  log "    Empty (factory)."
+fi
+
+# Executables in shared/temp locations: droppers stage here before
+# installing persistence. Scripts and Mach-O only; installer debris is noise.
+log "\n  ${BOLD}Executables staged in shared / temp locations:${RESET}"
+TMPEXEC_FOUND=false
+while IFS= read -r TX; do
+  [ -z "$TX" ] && continue
+  KIND=$(file -b "$TX" 2>/dev/null | cut -c1-60)
+  case "$KIND" in *Mach-O*|*script*|*executable*) ;; *) continue ;; esac
+  TMPEXEC_FOUND=true
+  log "    ${RED}[EXEC]${RESET} $TX — $KIND — owner $(stat -f "%Su" "$TX" 2>/dev/null), $(sig_status "$TX")"
+  REVIEW_ONLY+=("Executable in shared/temp location: $TX ($KIND)")
+done < <(find /Users/Shared /private/tmp /private/var/tmp "${TMPDIR:-/nonexistent}" -maxdepth 3 -type f -perm -100 2>/dev/null | head -50)
+[ "$TMPEXEC_FOUND" = false ] && log "    None."
+
 # ============================================================
 # [6] ACTIVE DATA COLLECTORS
 # ============================================================
@@ -511,29 +750,75 @@ done
 # ============================================================
 section "TCC PRIVACY PERMISSIONS (what can access your data)"
 
-TCC_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
-if [ -r "$TCC_DB" ]; then
-  for SERVICE in kTCCServiceSystemPolicyAllFiles kTCCServiceMicrophone kTCCServiceCamera kTCCServiceAccessibility kTCCServiceScreenCapture; do
-    log "\n  $SERVICE:"
-    sqlite3 "$TCC_DB" "SELECT client, auth_value FROM access WHERE service='$SERVICE';" 2>/dev/null | \
-    while IFS='|' read -r CLIENT AUTH; do
-      STATUS=$( [ "$AUTH" = "2" ] && echo "${RED}ALLOWED${RESET}" || echo "${GREEN}DENIED${RESET}" )
-      log "    $STATUS — $CLIENT"
-    done
+# FIX: the old check only read the USER TCC.db, but Full Disk Access,
+# Accessibility, Screen Recording and Input Monitoring grants are stored in
+# the SYSTEM TCC.db — so the most dangerous grants were never shown. Both
+# are read now, and the readability test is a real read (see HAS_FDA).
+# auth_value: 0 denied, 2 allowed, 3 limited.
+TCC_SERVICES="kTCCServiceSystemPolicyAllFiles kTCCServiceAccessibility kTCCServiceScreenCapture kTCCServiceListenEvent kTCCServicePostEvent kTCCServiceMicrophone kTCCServiceCamera kTCCServiceAppleEvents kTCCServiceSystemPolicyDesktopFolder kTCCServiceSystemPolicyDocumentsFolder kTCCServiceSystemPolicyDownloadsFolder kTCCServiceSystemPolicyRemovableVolumes kTCCServiceSystemPolicyNetworkVolumes kTCCServiceEndpointSecurityClient kTCCServiceDeveloperTool"
+TCC_ANY=false
+for DBINFO in "user|$USER_TCC_DB" "system|$SYS_TCC_DB"; do
+  DBLABEL="${DBINFO%%|*}"; DB="${DBINFO#*|}"
+  if ! head -c1 "$DB" >/dev/null 2>&1; then
+    log "  ${YELLOW}$DBLABEL TCC.db not readable${RESET} — grant Terminal Full Disk Access (System Settings → Privacy & Security → Full Disk Access)."
+    continue
+  fi
+  TCC_ANY=true
+  log "\n  ${BOLD}[$DBLABEL TCC.db]${RESET}"
+  for SERVICE in $TCC_SERVICES; do
+    ROWS=$(sqlite3 "$DB" "SELECT client, client_type, auth_value FROM access WHERE service='$SERVICE' ORDER BY auth_value DESC, client;" 2>/dev/null)
+    [ -z "$ROWS" ] && continue
+    log "    ${SERVICE#kTCCService}:"
+    while IFS='|' read -r CLIENT CTYPE AUTH; do
+      case "$AUTH" in
+        2) STATUS="${RED}ALLOWED${RESET}" ;;
+        3) STATUS="${YELLOW}LIMITED${RESET}" ;;
+        *) STATUS="${GREEN}denied${RESET}" ;;
+      esac
+      EXTRA=""
+      # client_type 1 = absolute path. A grant to a path that no longer
+      # exists can be re-used by anything dropped at that path.
+      if [ "$CTYPE" = "1" ] && [ ! -e "$CLIENT" ]; then
+        EXTRA=" ${YELLOW}(stale — path no longer exists)${RESET}"
+        [ "$AUTH" = "2" ] && REVIEW_ONLY+=("Stale TCC grant ${SERVICE#kTCCService} → missing path $CLIENT (remove in Privacy & Security)")
+      fi
+      log "      $STATUS — $CLIENT$EXTRA"
+      if [ "$AUTH" = "2" ]; then
+        case "$SERVICE" in
+          kTCCServiceSystemPolicyAllFiles|kTCCServiceAccessibility|kTCCServiceScreenCapture|kTCCServiceListenEvent|kTCCServicePostEvent)
+            case "$CLIENT" in com.apple.*|/System/*|/usr/libexec/*) ;; *) note_mod "TCC ${SERVICE#kTCCService} granted to $CLIENT" ;; esac ;;
+        esac
+      fi
+    done <<< "$ROWS"
   done
-else
-  log "  ${YELLOW}TCC database not readable.${RESET} Enable Full Disk Access for Terminal to read it: System Settings → Privacy & Security → Full Disk Access."
-fi
+done
+[ "$TCC_ANY" = false ] && log "  (Nothing readable — both databases need Full Disk Access.)"
 
 # ============================================================
 # [8] LAUNCH AGENTS & DAEMONS
 # ============================================================
 section "LAUNCH AGENTS & DAEMONS (auto-start persistence)"
 
-for LAUNCH_DIR in "$HOME/Library/LaunchAgents" "/Library/LaunchAgents" "/Library/LaunchDaemons"; do
+# Under sudo, every other account's LaunchAgents (and root's) are audited too.
+LAUNCH_DIRS=("$HOME/Library/LaunchAgents" "/Library/LaunchAgents" "/Library/LaunchDaemons")
+if [ "$IS_ROOT" = true ]; then
+  for UH in /Users/* /var/root; do
+    [ "$UH" = "$HOME" ] && continue
+    [ -d "$UH/Library/LaunchAgents" ] && LAUNCH_DIRS+=("$UH/Library/LaunchAgents")
+  done
+fi
+INTERPRETERS='^(/bin/(ba|z|da|k|c|tc)?sh|/usr/bin/(env|python3?|perl|ruby|osascript|node)|/usr/local/bin/(python3?|node)|/opt/homebrew/bin/(python3?|node))$'
+
+# FIX: this loop used to be `find | grep | while` — a subshell — so the
+# SHub/AdLoad IOC hits below were appended to a throwaway copy of REVIEW_ONLY
+# and NEVER reached the summary (same bug fixed in section 3 in 2026-07).
+for LAUNCH_DIR in "${LAUNCH_DIRS[@]}"; do
   if [ -d "$LAUNCH_DIR" ]; then
     log "\n  ${BOLD}$LAUNCH_DIR:${RESET}"
-    find "$LAUNCH_DIR" -maxdepth 1 -name "*.plist" 2>/dev/null | grep -v "com\.apple\." | while read -r PLIST; do
+    RUNS_AS_ROOT=false
+    [ "$LAUNCH_DIR" = "/Library/LaunchDaemons" ] && RUNS_AS_ROOT=true
+    while IFS= read -r PLIST; do
+      [ -z "$PLIST" ] && continue
       PROGRAM=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null)
       [ -z "$PROGRAM" ] && PROGRAM=$(/usr/libexec/PlistBuddy -c "Print :Program" "$PLIST" 2>/dev/null)
       # Fallback (added 2026-07-03): both keystone plists showed "unknown
@@ -541,6 +826,19 @@ for LAUNCH_DIR in "$HOME/Library/LaunchAgents" "/Library/LaunchAgents" "/Library
       # any plist (binary or XML); grab the first ProgramArguments entry.
       [ -z "$PROGRAM" ] && PROGRAM=$(plutil -p "$PLIST" 2>/dev/null | \
         awk -F'"' '/"ProgramArguments"/{f=1; next} f && NF >= 2 {print $2; exit}')
+      # com.apple.* labels used to be skipped outright — but Apple's own
+      # plists live in /System/Library (SIP-protected); a com.apple.* name in
+      # these third-party dirs is either an Apple-signed add-on (Xcode, etc.)
+      # or malware masquerading as Apple. Signature decides.
+      case "$(basename "$PLIST")" in
+        com.apple.*)
+          case "$(sig_status "$PROGRAM")" in
+            *"Software Signing"*|*"Apple Mac OS Application Signing"*) continue ;;
+          esac
+          log "    ${RED}[MASQUERADE?]${RESET} $(basename "$PLIST") uses an Apple label but its program is not Apple-signed: ${PROGRAM:-unknown} ($(sig_status "$PROGRAM"))"
+          REVIEW_ONLY+=("Apple-named launchd item with non-Apple program: $PLIST -> ${PROGRAM:-unknown}")
+          continue ;;
+      esac
       log "    ${YELLOW}[NON-APPLE]${RESET} $(basename "$PLIST") → ${PROGRAM:-unknown binary}"
 
       # --- SHub "Reaper" infostealer IOC (disclosed May 2026) ---
@@ -572,7 +870,56 @@ for LAUNCH_DIR in "$HOME/Library/LaunchAgents" "/Library/LaunchAgents" "/Library
         log "    ${RED}[SUSPICIOUS NAME]${RESET} $PLIST_NAME — long randomly-generated label, matches AdLoad/UpdateAgent adware persistence pattern. Review Program path: ${PROGRAM:-unknown}"
         REVIEW_ONLY+=("SUSPICIOUS LaunchAgent (random-name pattern): $PLIST")
       fi
-    done
+
+      # --- Program integrity (added 2026-09) ---
+      # Interpreter launchers (sh/python/osascript …) hide the real payload
+      # in the next argument — inspect that instead of /bin/sh.
+      TARGET="$PROGRAM"
+      if echo "$PROGRAM" | grep -Eq "$INTERPRETERS"; then
+        ARG1=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$PLIST" 2>/dev/null)
+        [ "$ARG1" = "-c" ] || [ "$ARG1" = "-e" ] && ARG1=""
+        [ -n "$ARG1" ] && [ "${ARG1#/}" != "$ARG1" ] && TARGET="$ARG1"
+        log "      via interpreter $PROGRAM${ARG1:+ → $ARG1}"
+      fi
+      PL_DUMP=$(plutil -p "$PLIST" 2>/dev/null)
+      if echo "$PL_DUMP" | grep -Eq 'curl |wget |base64 (-d|-D|--decode)|/dev/tcp/|osascript -e|python3? -c|eval '; then
+        log "      ${RED}[INLINE CODE]${RESET} arguments contain download/decode/eval — typical dropper persistence"
+        REVIEW_ONLY+=("launchd item runs inline download/decode/eval code: $PLIST")
+      fi
+      if echo "$PL_DUMP" | grep -q 'DYLD_INSERT_LIBRARIES'; then
+        log "      ${RED}[INJECTION]${RESET} sets DYLD_INSERT_LIBRARIES"
+        REVIEW_ONLY+=("launchd item injects a dylib (DYLD_INSERT_LIBRARIES): $PLIST")
+      fi
+      if [ -n "$TARGET" ] && [ "${TARGET#/}" != "$TARGET" ]; then
+        SIG=$(sig_status "$TARGET")
+        log "      program: $TARGET — $SIG"
+        if [ "$SIG" = "MISSING" ]; then
+          note_mod "Stale launchd item (program missing): $PLIST"
+        elif [ "$SIG" = "UNSIGNED" ] && is_macho "$TARGET"; then
+          REVIEW_ONLY+=("Unsigned Mach-O launched at startup: $TARGET ($PLIST)")
+        fi
+        if suspicious_location "$TARGET"; then
+          log "      ${RED}[LOCATION]${RESET} runs from a hidden/temp/shared path"
+          REVIEW_ONLY+=("launchd program in hidden/temp/shared location: $TARGET ($PLIST)")
+        fi
+      fi
+      # Privilege escalation: root runs whatever a non-root user can rewrite.
+      if [ "$RUNS_AS_ROOT" = true ]; then
+        DAEMON_USER=$(/usr/libexec/PlistBuddy -c "Print :UserName" "$PLIST" 2>/dev/null)
+        if [ -z "$DAEMON_USER" ] || [ "$DAEMON_USER" = "root" ]; then
+          if writable_by_nonroot "$PLIST"; then
+            log "      ${RED}[PRIVESC]${RESET} plist is writable by non-root ($(stat -f '%Su:%Sg %Sp' "$PLIST" 2>/dev/null))"
+            REVIEW_ONLY+=("PRIVESC: LaunchDaemon plist writable by non-root: $PLIST")
+          fi
+          if [ -n "$TARGET" ] && [ -e "$TARGET" ]; then
+            if writable_by_nonroot "$TARGET" || writable_by_nonroot "$(dirname "$TARGET")"; then
+              log "      ${RED}[PRIVESC]${RESET} root runs a program (or its folder) writable by non-root: $TARGET ($(stat -f '%Su:%Sg %Sp' "$TARGET" 2>/dev/null))"
+              REVIEW_ONLY+=("PRIVESC: root LaunchDaemon runs non-root-writable program: $TARGET ($PLIST)")
+            fi
+          fi
+        fi
+      fi
+    done < <(find "$LAUNCH_DIR" -maxdepth 1 -name "*.plist" 2>/dev/null)
   fi
 done
 
@@ -587,7 +934,7 @@ done
 section "OTHER PERSISTENCE & STARTUP (login items, cron, hooks, legacy)"
 
 log "  ${BOLD}Login items (System Events):${RESET}"
-LOGIN_ITEMS=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null)
+LOGIN_ITEMS=$(as_user osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null)
 if [ -n "$LOGIN_ITEMS" ]; then
   echo "$LOGIN_ITEMS" | tr ',' '\n' | sed 's/^ *//' | while read -r ITEM; do
     [ -n "$ITEM" ] && log "    ${YELLOW}[LOGIN ITEM]${RESET} $ITEM"
@@ -601,8 +948,16 @@ fi
 # Login/Logout hooks: legacy mechanism, still honored by loginwindow. Nothing
 # modern installs these — anything here is either very old or persistence.
 log "\n  ${BOLD}Login/Logout hooks (legacy, should be empty):${RESET}"
-LHOOK=$(defaults read com.apple.loginwindow LoginHook 2>/dev/null)
-LOHOOK=$(defaults read com.apple.loginwindow LogoutHook 2>/dev/null)
+# FIX: hooks are written with `sudo defaults write com.apple.loginwindow`,
+# i.e. into ROOT's preferences (/var/root/Library/Preferences) — the old
+# check read the invoking user's domain and could never see them. Read the
+# plist files directly (root's needs sudo; /Library's is world-readable).
+LHOOK=""; LOHOOK=""
+for LWP in /var/root/Library/Preferences/com.apple.loginwindow /Library/Preferences/com.apple.loginwindow "$HOME/Library/Preferences/com.apple.loginwindow"; do
+  [ -z "$LHOOK" ]  && LHOOK=$(defaults read "$LWP" LoginHook 2>/dev/null)
+  [ -z "$LOHOOK" ] && LOHOOK=$(defaults read "$LWP" LogoutHook 2>/dev/null)
+done
+[ "$IS_ROOT" = false ] && [ -z "$LHOOK$LOHOOK" ] && log "    (root's loginwindow prefs are only readable under sudo)"
 if [ -n "$LHOOK" ] || [ -n "$LOHOOK" ]; then
   [ -n "$LHOOK" ]  && log "    ${RED}[FOUND]${RESET} LoginHook  → $LHOOK"
   [ -n "$LOHOOK" ] && log "    ${RED}[FOUND]${RESET} LogoutHook → $LOHOOK"
@@ -612,7 +967,7 @@ else
 fi
 
 log "\n  ${BOLD}Cron / at jobs (rare on modern macOS — anything here is a deliberate add or persistence):${RESET}"
-USER_CRON=$(crontab -l 2>/dev/null | grep -vE '^\s*#|^\s*$')
+USER_CRON=$(as_user crontab -l 2>/dev/null | grep -vE '^\s*#|^\s*$')
 if [ -n "$USER_CRON" ]; then
   echo "$USER_CRON" | while read -r LINE; do log "    ${YELLOW}[CRON]${RESET} $LINE"; done
   note_mod "User crontab has $(echo "$USER_CRON" | wc -l | tr -d ' ') entr(y/ies)"
@@ -654,12 +1009,96 @@ if [ -d /etc/emond.d/rules ]; then
     REVIEW_ONLY+=("Non-sample emond rules present")
   fi
 fi
+
+# periodic(8) runs these as ROOT daily/weekly/monthly. Factory set below;
+# any extra script, or any *.local file, is root persistence.
+log "\n  ${BOLD}periodic scripts (run as root):${RESET}"
+PERIODIC_FOUND=false
+PERIODIC_FACTORY=" daily/110.clean-tmps daily/130.clean-msgs daily/140.clean-rwho daily/199.rotate-fax daily/310.accounting daily/400.status-disks daily/420.status-network daily/430.status-rwho daily/999.local weekly/320.whatis weekly/999.local monthly/199.rotate-fax monthly/200.accounting monthly/999.local "
+for PD in daily weekly monthly; do
+  for PF in /etc/periodic/$PD/*; do
+    [ -e "$PF" ] || continue
+    case "$PERIODIC_FACTORY" in *" $PD/$(basename "$PF") "*) continue ;; esac
+    PERIODIC_FOUND=true
+    log "    ${RED}[EXTRA]${RESET} $PF — not in the factory periodic set (owner $(stat -f %Su "$PF" 2>/dev/null))"
+    REVIEW_ONLY+=("Non-factory periodic script (runs as root): $PF")
+  done
+done
+for PL in /etc/daily.local /etc/weekly.local /etc/monthly.local /etc/periodic.conf /etc/periodic.conf.local /usr/local/etc/periodic; do
+  if [ -e "$PL" ]; then
+    PERIODIC_FOUND=true
+    log "    ${RED}[FOUND]${RESET} $PL — local periodic hook, executed as root"
+    REVIEW_ONLY+=("Periodic local hook present (runs as root): $PL")
+  fi
+done
+[ "$PERIODIC_FOUND" = false ] && log "    Factory set only."
+
+# Authorization plugins load into SecurityAgent/authd at login and see the
+# password in clear (MITRE T1547.002). Apple's live in /System; this dir is
+# empty on a factory install.
+log "\n  ${BOLD}Authorization plugins (/Library/Security/SecurityAgentPlugins):${RESET}"
+AUTHPLUG=$(ls -A /Library/Security/SecurityAgentPlugins 2>/dev/null | grep -v '^\.DS_Store$')
+if [ -n "$AUTHPLUG" ]; then
+  while IFS= read -r AP; do
+    log "    ${RED}[AUTH PLUGIN]${RESET} $AP — $(sig_status "/Library/Security/SecurityAgentPlugins/$AP")"
+    REVIEW_ONLY+=("Authorization plugin installed (sees login passwords): /Library/Security/SecurityAgentPlugins/$AP")
+  done <<< "$AUTHPLUG"
+else
+  log "    None (factory)."
+fi
+
+# Directory-service and PAM plug-ins are another credential-interception spot.
+DSPLUG=$(ls -A /Library/DirectoryServices/PlugIns 2>/dev/null | grep -v '^\.DS_Store$')
+if [ -n "$DSPLUG" ]; then
+  echo "$DSPLUG" | while IFS= read -r DP; do log "    ${YELLOW}[DS PLUGIN]${RESET} /Library/DirectoryServices/PlugIns/$DP"; done
+  note_mod "DirectoryServices plug-ins: $(echo "$DSPLUG" | tr '\n' ' ')"
+fi
+PAM_EXTRA=$(ls -A /usr/local/lib/pam /opt/homebrew/lib/pam 2>/dev/null | grep -v ':$' | grep -v '^$')
+if [ -n "$PAM_EXTRA" ]; then
+  log "    ${YELLOW}[PAM MODULES]${RESET} third-party PAM modules present: $(echo "$PAM_EXTRA" | tr '\n' ' ')"
+  note_mod "Third-party PAM modules: $(echo "$PAM_EXTRA" | tr '\n' ' ')"
+fi
+
+# Root-only: authoritative background-item database and every crontab.
+if [ "$IS_ROOT" = true ]; then
+  log "\n  ${BOLD}Background Task Management (sfltool dumpbtm — non-Apple items):${RESET}"
+  BTM=$(sfltool dumpbtm 2>/dev/null | awk '
+    function flush() { if (id != "" && id !~ /^com\.apple\./ && tm != "Apple") printf "%s | %s | %s | %s | %s\n", (nm==""?"?":nm), id, ty, dp, (ex==""?url:ex); nm=id=ty=dp=ex=url=tm="" }
+    /^ *#[0-9]+:/ { flush(); next }
+    /^ +Name: /            { sub(/^ +Name: /,"");            nm=$0 }
+    /^ +Identifier: /      { sub(/^ +Identifier: /,"");      id=$0 }
+    /^ +Type: /            { sub(/^ +Type: /,"");            ty=$0 }
+    /^ +Disposition: /     { sub(/^ +Disposition: /,"");     dp=$0 }
+    /^ +Executable Path: / { sub(/^ +Executable Path: /,""); ex=$0 }
+    /^ +URL: /             { sub(/^ +URL: /,"");             url=$0 }
+    /^ +Developer Name: /  { sub(/^ +Developer Name: /,"");  if ($0 ~ /^Apple/) tm="Apple" }
+    END { flush() }' | sort -u)
+  if [ -n "$BTM" ]; then
+    echo "$BTM" | while IFS= read -r LINE; do log "    $LINE"; done
+    note_mod "$(echo "$BTM" | wc -l | tr -d ' ') non-Apple background items registered (sfltool dumpbtm)"
+  else
+    log "    None parsed (or sfltool output format changed — run 'sudo sfltool dumpbtm' manually)."
+  fi
+
+  log "\n  ${BOLD}All crontabs (/usr/lib/cron/tabs):${RESET}"
+  CRONTABS=$(ls -A /usr/lib/cron/tabs 2>/dev/null)
+  if [ -n "$CRONTABS" ]; then
+    while IFS= read -r CU; do
+      log "    ${YELLOW}[CRONTAB]${RESET} $CU:"
+      grep -vE '^\s*#|^\s*$' "/usr/lib/cron/tabs/$CU" 2>/dev/null | while IFS= read -r LINE; do log "      $LINE"; done
+      [ "$CU" = "root" ] && REVIEW_ONLY+=("root crontab present")
+    done <<< "$CRONTABS"
+  else
+    log "    None."
+  fi
+fi
+
 log "    (LaunchAgents/Daemons are covered in section 8.)"
 
 # ============================================================
 # [10] SYSTEM MODIFICATIONS (/etc, kexts, profiles, users, CAs)
 # ============================================================
-section "SYSTEM MODIFICATIONS (/etc, kernel/system extensions, profiles, users, trust)"
+section "SYSTEM MODIFICATIONS (/etc, sudo, shell/PATH, kernel/system extensions, profiles, trust)"
 
 log "  ${BOLD}/etc/hosts — entries beyond the factory three:${RESET}"
 EXTRA_HOSTS=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' /etc/hosts 2>/dev/null | \
@@ -688,6 +1127,25 @@ if [ -f /etc/pam.d/sudo_local ]; then
     grep -vE '^\s*#|^\s*$' /etc/pam.d/sudo_local 2>/dev/null | while read -r LINE; do log "      $LINE"; done
     REVIEW_ONLY+=("/etc/pam.d/sudo_local has non-standard content")
   fi
+fi
+
+if [ "$IS_ROOT" = true ]; then
+  # NOPASSWD / !authenticate = anything running as you gets root silently.
+  SUDO_RULES=$(grep -hvE '^\s*#|^\s*$|^\s*Defaults|^\s*@?#?include' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | \
+    grep -vE '^\s*root\s+ALL\s*=\s*\(ALL\)\s*ALL\s*$|^\s*%admin\s+ALL\s*=\s*\(ALL\)\s*ALL\s*$')
+  if [ -n "$SUDO_RULES" ]; then
+    log "    ${YELLOW}[SUDOERS]${RESET} non-factory rules:"
+    echo "$SUDO_RULES" | while IFS= read -r LINE; do log "      $LINE"; done
+    note_mod "Non-factory sudoers rules present"
+  else
+    log "    sudoers rules: factory (root + %admin only)."
+  fi
+  if echo "$SUDO_RULES" | grep -qE 'NOPASSWD|!authenticate'; then
+    log "    ${RED}[NOPASSWD]${RESET} passwordless sudo rule present — any process running as that user can become root."
+    REVIEW_ONLY+=("Passwordless sudo rule (NOPASSWD/!authenticate) in sudoers")
+  fi
+else
+  log "    (sudoers rules readable only under sudo)"
 fi
 
 log "\n  ${BOLD}Other /etc modifications:${RESET}"
@@ -748,29 +1206,20 @@ if [ -n "$PROFILES_OUT" ]; then
   echo "$PROFILES_OUT" | while read -r LINE; do log "    ${YELLOW}[PROFILE]${RESET} $LINE"; done
   note_mod "Configuration profiles installed (see section 10)"
 else
-  log "    None at user level. (System-level check needs sudo: 'sudo profiles list')."
+  log "    None$([ "$IS_ROOT" = false ] && echo " at user level. (System-level check needs sudo.)")"
 fi
-
-log "\n  ${BOLD}Local user accounts (UID >= 500) & admin group:${RESET}"
-dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 500' | while read -r U UID_; do
-  log "    [USER] $U (uid $UID_)"
-done
-HIDDEN_USERS=$(dscl . -list /Users IsHidden 2>/dev/null | awk '$2 == 1 {print $1}')
-if [ -n "$HIDDEN_USERS" ]; then
-  echo "$HIDDEN_USERS" | while read -r U; do
-    log "    ${RED}[HIDDEN USER]${RESET} $U — hidden accounts are a classic persistence trick; verify you created this."
-  done
-  REVIEW_ONLY+=("Hidden user account(s): $(echo "$HIDDEN_USERS" | tr '\n' ' ')")
+ENROLL=$(profiles status -type enrollment 2>/dev/null)
+if echo "$ENROLL" | grep -qi "MDM enrollment: Yes"; then
+  log "    ${YELLOW}[MDM]${RESET} $(echo "$ENROLL" | tr '\n' ' ')"
+  REVIEW_ONLY+=("Mac is MDM-enrolled — an organisation can push profiles/software; verify it's expected")
 fi
-ADMIN_MEMBERS=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership: //')
-log "    Admin group members: ${ADMIN_MEMBERS:-unreadable}"
 
 log "\n  ${BOLD}Custom certificate trust settings (MITM proxies, corp CAs):${RESET}"
-TRUST_USER=$(security dump-trust-settings 2>/dev/null | grep -c "Cert " || true)
+TRUST_USER=$(as_user security dump-trust-settings 2>/dev/null | grep -c "Cert " || true)
 TRUST_ADMIN=$(security dump-trust-settings -d 2>/dev/null | grep -c "Cert " || true)
 if [ "${TRUST_USER:-0}" -gt 0 ] || [ "${TRUST_ADMIN:-0}" -gt 0 ]; then
   log "    ${YELLOW}[MODIFIED]${RESET} Custom trust settings: ${TRUST_USER:-0} user-domain, ${TRUST_ADMIN:-0} admin-domain cert(s)."
-  security dump-trust-settings 2>/dev/null | grep "Cert " | while read -r LINE; do log "      [user]  $LINE"; done
+  as_user security dump-trust-settings 2>/dev/null | grep "Cert " | while read -r LINE; do log "      [user]  $LINE"; done
   security dump-trust-settings -d 2>/dev/null | grep "Cert " | while read -r LINE; do log "      [admin] $LINE"; done
   note_mod "Custom certificate trust settings (${TRUST_USER:-0} user / ${TRUST_ADMIN:-0} admin)"
 else
@@ -785,12 +1234,58 @@ for RC in .zshrc .zprofile .zshenv .zlogin .bashrc .bash_profile .profile; do
   MODIFIED=$(stat -f "%Sm" -t "%Y-%m-%d" "$RCF" 2>/dev/null)
   log "    ~/$RC — ${LINES:-0} effective lines, modified $MODIFIED"
   # Red flags: pipe-a-download-to-shell, base64-decoded eval, dylib injection.
-  SUS=$(grep -nE '(curl|wget)[^|;]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|/bin/)?sh|eval[[:space:]].*base64|base64[[:space:]]+(-d|-D|--decode)[^|]*\|[[:space:]]*(ba|z)?sh|DYLD_INSERT_LIBRARIES' "$RCF" 2>/dev/null)
+  SUS=$(grep -nE "$SUS_RC_RE" "$RCF" 2>/dev/null)
   if [ -n "$SUS" ]; then
     echo "$SUS" | while read -r LINE; do log "      ${RED}[SUSPICIOUS]${RESET} $LINE"; done
     REVIEW_ONLY+=("Suspicious line(s) in ~/$RC — pipe-to-shell / base64-eval / dylib injection pattern")
   fi
 done
+
+# System-wide startup files run for EVERY user's shell. /etc/zshenv runs
+# even for non-interactive zsh (scripts, cron) — prime injection point.
+log "\n  ${BOLD}System-wide shell startup files (/etc):${RESET}"
+for RC in /etc/zshenv /etc/zprofile /etc/zshrc /etc/zlogin /etc/zlogout /etc/profile /etc/bashrc; do
+  [ -f "$RC" ] || continue
+  MODIFIED=$(stat -f "%Sm" -t "%Y-%m-%d" "$RC" 2>/dev/null)
+  case "$RC" in
+    /etc/zshenv|/etc/zlogin|/etc/zlogout)
+      log "    ${YELLOW}[NON-FACTORY]${RESET} $RC exists (not shipped by Apple), modified $MODIFIED"
+      note_mod "$RC exists (system-wide shell startup, not factory)" ;;
+    *) log "    $RC — modified $MODIFIED" ;;
+  esac
+  SUS=$(grep -nE "$SUS_RC_RE" "$RC" 2>/dev/null)
+  if [ -n "$SUS" ]; then
+    echo "$SUS" | while IFS= read -r LINE; do log "      ${RED}[SUSPICIOUS]${RESET} $LINE"; done
+    REVIEW_ONLY+=("Suspicious line(s) in $RC (applies to all users)")
+  fi
+done
+PATHS_D=$(ls -A /etc/paths.d 2>/dev/null)
+[ -n "$PATHS_D" ] && log "    /etc/paths.d: $(echo "$PATHS_D" | tr '\n' ' ')"
+
+# PATH hijack: a writable dir ahead of /usr/bin lets anything drop a fake
+# `sudo`/`ls`/`git` that runs next time you type it.
+log "\n  ${BOLD}PATH order & writability (dirs searched before /usr/bin):${RESET}"
+AUDIT_PATH=$(as_user /bin/zsh -lc 'echo $PATH' </dev/null 2>/dev/null | tail -1)
+[ -z "$AUDIT_PATH" ] && AUDIT_PATH="$PATH"
+PATH_ISSUE=false
+OLDIFS="$IFS"; IFS=':'
+for PD in $AUDIT_PATH; do
+  [ "$PD" = "/usr/bin" ] && break
+  if [ -z "$PD" ] || [ "$PD" = "." ]; then
+    log "    ${RED}[PATH]${RESET} empty or '.' entry — current directory is searched before system binaries"
+    REVIEW_ONLY+=("PATH contains '.' or an empty entry before /usr/bin"); PATH_ISSUE=true; continue
+  fi
+  [ -d "$PD" ] || continue
+  PMODE=$(perm_of "$PD"); PMODE=${PMODE:-0}
+  if [ $(( 8#$PMODE & 2 )) -ne 0 ]; then
+    log "    ${RED}[PATH]${RESET} $PD is WORLD-writable and searched before /usr/bin"
+    REVIEW_ONLY+=("World-writable PATH dir ahead of /usr/bin: $PD"); PATH_ISSUE=true
+  elif [ "$(stat -f %Su "$PD" 2>/dev/null)" != "root" ]; then
+    log "    $PD — owned by $(stat -f %Su "$PD" 2>/dev/null) (normal for Homebrew/user bins; anything running as you can shadow commands here)"
+  fi
+done
+IFS="$OLDIFS"
+[ "$PATH_ISSUE" = false ] && log "    No world-writable or '.' entries ahead of /usr/bin."
 
 log "\n  ${BOLD}/usr/local & /opt (everything here is non-factory by definition):${RESET}"
 for D in /usr/local /opt; do
@@ -803,12 +1298,279 @@ done
 log "    (Homebrew owns /opt/homebrew on Apple Silicon, /usr/local on Intel — its presence there is expected.)"
 
 # ============================================================
-# [11] APP EXTENSIONS & PLUG-INS
+# [11] ROOT & PRIVILEGE SURFACE (added 2026-09)
+# ============================================================
+section "ROOT & PRIVILEGE SURFACE (/, SUID, privileged helpers, writable system paths)"
+
+# The root of the boot volume is a merged view of the sealed System volume
+# and firmlinks/synthetic entries. Anything beyond this set was added.
+log "  ${BOLD}Top level of / (non-factory entries):${RESET}"
+ROOT_FACTORY=" Applications Library System Users Volumes bin cores dev etc home opt private sbin tmp usr var .file .vol .VolumeIcon.icns .nofollow .resolve .DS_Store .Spotlight-V100 .fseventsd .Trashes .DocumentRevisions-V100 .PKInstallSandboxManager-SystemSoftware .TemporaryItems .com.apple.templatemigration.boot-install "
+ROOT_EXTRA_FOUND=false
+while IFS= read -r RE; do
+  [ -z "$RE" ] && continue
+  case "$ROOT_FACTORY" in *" $RE "*) continue ;; esac
+  ROOT_EXTRA_FOUND=true
+  RP="/$RE"
+  KIND="dir"; [ -L "$RP" ] && KIND="symlink → $(readlink "$RP")"; [ -f "$RP" ] && KIND="file"
+  log "    ${YELLOW}[NON-FACTORY]${RESET} $RP ($KIND, owner $(stat -f %Su "$RP" 2>/dev/null))"
+  if [ -f "$RP" ] && [ -x "$RP" ]; then
+    REVIEW_ONLY+=("Executable file at filesystem root: $RP")
+  else
+    ROOT_EXTRA_LIST="${ROOT_EXTRA_LIST:-}$RP "
+  fi
+done < <(ls -A / 2>/dev/null)
+[ -n "${ROOT_EXTRA_LIST:-}" ] && note_mod "Non-factory entries at /: $ROOT_EXTRA_LIST"
+[ "$ROOT_EXTRA_FOUND" = false ] && log "    None (only factory entries and firmlinks)."
+[ -d /opt ] && log "    (/opt itself is non-factory but expected with Homebrew on Apple Silicon.)"
+
+# SUID/SGID outside SIP-protected paths: any such binary is a root (or
+# group) escalation primitive that Apple did not ship.
+log "\n  ${BOLD}SUID/SGID binaries outside SIP-protected paths:${RESET}"
+SUID_COUNT=0
+while IFS= read -r SF; do
+  [ -z "$SF" ] && continue
+  SUID_COUNT=$((SUID_COUNT + 1))
+  [ "$SUID_COUNT" -gt 40 ] && continue
+  SOWN=$(stat -f "%Su:%Sg %Sp" "$SF" 2>/dev/null)
+  SSIG=$(sig_status "$SF")
+  log "    ${YELLOW}[SUID/SGID]${RESET} $SF — $SOWN — $SSIG"
+  if [ "$SSIG" = "UNSIGNED" ] || [ "$SSIG" = "ad-hoc" ] || suspicious_location "$SF"; then
+    REVIEW_ONLY+=("SUID/SGID binary, unsigned/ad-hoc or in odd location: $SF ($SOWN)")
+  else
+    note_mod "Signed SUID/SGID binary outside system paths: $SF"
+  fi
+done < <(
+  find /usr/local /opt /Library /Applications /Users/Shared /private/tmp /private/var/tmp -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null
+  find "$HOME" -xdev -maxdepth 4 \( -path "$HOME/Library" \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null
+)
+[ "$SUID_COUNT" -gt 40 ] && log "    … $((SUID_COUNT - 40)) more not shown."
+[ "$SUID_COUNT" -eq 0 ] && log "    None (expected)."
+
+# Privileged helper tools run as root on demand (SMJobBless). They are
+# left behind when the owning app is dragged to the Trash.
+log "\n  ${BOLD}Privileged helper tools (/Library/PrivilegedHelperTools — run as root):${RESET}"
+PHT_FOUND=false
+DAEMON_DUMP=$(for P in /Library/LaunchDaemons/*.plist; do [ -f "$P" ] && plutil -p "$P" 2>/dev/null; done)
+while IFS= read -r PH; do
+  [ -z "$PH" ] && continue
+  PHT_FOUND=true
+  PHP="/Library/PrivilegedHelperTools/$PH"
+  PSIG=$(sig_status "$PHP")
+  STATE="registered"
+  echo "$DAEMON_DUMP" | grep -qF "$PHP" || STATE="ORPHANED (no LaunchDaemon references it — owning app likely removed)"
+  log "    $PH — $PSIG — $STATE"
+  case "$STATE" in ORPHANED*) REVIEW_ONLY+=("Orphaned root helper (leftover of an uninstalled app?): $PHP") ;; esac
+  [ "$PSIG" = "UNSIGNED" ] && REVIEW_ONLY+=("Unsigned privileged helper tool: $PHP")
+  if writable_by_nonroot "$PHP"; then
+    log "      ${RED}[PRIVESC]${RESET} writable by non-root ($(stat -f '%Su:%Sg %Sp' "$PHP" 2>/dev/null))"
+    REVIEW_ONLY+=("PRIVESC: privileged helper writable by non-root: $PHP")
+  fi
+done < <(ls -A /Library/PrivilegedHelperTools 2>/dev/null | grep -v '^\.DS_Store$')
+[ "$PHT_FOUND" = false ] && log "    None."
+[ "$PHT_FOUND" = true ] && note_mod "Privileged helper tools installed: $(ls -A /Library/PrivilegedHelperTools 2>/dev/null | grep -v '^\.DS_Store$' | tr '\n' ' ')"
+
+# World-writable (non-sticky) files/dirs under system-wide paths: root
+# processes that read or execute from them can be hijacked by any user.
+log "\n  ${BOLD}World-writable files/dirs in /Library, /usr/local, /opt (non-sticky):${RESET}"
+WW=$(find /Library /usr/local /opt -xdev \( -type f -o -type d \) -perm -0002 ! -perm -1000 2>/dev/null)
+if [ -n "$WW" ]; then
+  WW_N=$(echo "$WW" | wc -l | tr -d ' ')
+  echo "$WW" | head -25 | while IFS= read -r LINE; do log "    ${RED}[WORLD-WRITABLE]${RESET} $LINE"; done
+  [ "$WW_N" -gt 25 ] && log "    … $((WW_N - 25)) more."
+  REVIEW_ONLY+=("$WW_N world-writable path(s) under /Library, /usr/local, /opt (see section 11)")
+else
+  log "    None."
+fi
+
+if [ "$IS_ROOT" = true ]; then
+  log "\n  ${BOLD}/var/root (root's home):${RESET}"
+  VR_ITEMS=$(ls -A /var/root 2>/dev/null | grep -vE '^(\.CFUserTextEncoding|Library|\.forward|\.DS_Store)$')
+  if [ -n "$VR_ITEMS" ]; then
+    log "    Non-default items: $(echo "$VR_ITEMS" | tr '\n' ' ')"
+    note_mod "/var/root contains: $(echo "$VR_ITEMS" | tr '\n' ' ')"
+  else
+    log "    Factory (no dotfiles beyond defaults)."
+  fi
+  for RC in .zshrc .zshenv .zprofile .bashrc .bash_profile .profile; do
+    [ -f "/var/root/$RC" ] || continue
+    SUS=$(grep -nE "$SUS_RC_RE" "/var/root/$RC" 2>/dev/null)
+    if [ -n "$SUS" ]; then
+      echo "$SUS" | while IFS= read -r LINE; do log "      ${RED}[SUSPICIOUS]${RESET} /var/root/$RC: $LINE"; done
+      REVIEW_ONLY+=("Suspicious line(s) in root's /var/root/$RC")
+    fi
+  done
+  if [ -s /var/root/.ssh/authorized_keys ]; then
+    log "    ${RED}[ROOT SSH KEYS]${RESET} /var/root/.ssh/authorized_keys:"
+    ssh-keygen -lf /var/root/.ssh/authorized_keys 2>/dev/null | while IFS= read -r LINE; do log "      $LINE"; done
+    REVIEW_ONLY+=("root has SSH authorized_keys (/var/root/.ssh/authorized_keys)")
+  fi
+else
+  log "\n  (/var/root is readable only under sudo.)"
+fi
+
+# ============================================================
+# [12] USER ACCOUNTS & HOME (added 2026-09)
+# ============================================================
+section "USER ACCOUNTS & HOME (accounts, logins, SSH, credentials, ownership)"
+
+log "  ${BOLD}Local user accounts (UID >= 500) & admin group:${RESET}"
+dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 500' | while read -r U UID_; do
+  log "    [USER] $U (uid $UID_, shell $(dscl . -read "/Users/$U" UserShell 2>/dev/null | awk '{print $2}'))"
+done
+HIDDEN_USERS=$(dscl . -list /Users IsHidden 2>/dev/null | awk '$2 == 1 {print $1}')
+if [ -n "$HIDDEN_USERS" ]; then
+  echo "$HIDDEN_USERS" | while read -r U; do
+    log "    ${RED}[HIDDEN USER]${RESET} $U — hidden accounts are a classic persistence trick; verify you created this."
+  done
+  REVIEW_ONLY+=("Hidden user account(s): $(echo "$HIDDEN_USERS" | tr '\n' ' ')")
+fi
+ADMIN_MEMBERS=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership: //')
+log "    Admin group members: ${ADMIN_MEMBERS:-unreadable}"
+
+# UID 0 = root, whatever the name. A second UID-0 account is a backdoor.
+UID0=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 == 0 && $1 != "root" {print $1}')
+if [ -n "$UID0" ]; then
+  log "    ${RED}[UID 0 CLONE]${RESET} account(s) with root's UID: $UID0"
+  REVIEW_ONLY+=("Non-root account(s) with UID 0 (root clone / backdoor): $UID0")
+fi
+# System-range accounts (UID < 500) that are NOT Apple's _service accounts
+# but can log in (real shell) — nothing Apple ships looks like this.
+# (Plain loop, not $(… case …): bash 3.2 mis-parses `case` patterns inside $().)
+SYS_SHELL=""
+while read -r U; do
+  case "$U" in _*|root|daemon|nobody) continue ;; esac
+  SH=$(dscl . -read "/Users/$U" UserShell 2>/dev/null | awk '{print $2}')
+  case "$SH" in ""|/usr/bin/false|/sbin/nologin|/usr/sbin/nologin) ;; *) SYS_SHELL="$SYS_SHELL $U($SH)" ;; esac
+done < <(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 < 500 {print $1}')
+SYS_SHELL="${SYS_SHELL# }"
+if [ -n "$SYS_SHELL" ]; then
+  log "    ${RED}[SYSTEM-RANGE LOGIN]${RESET} UID<500 account(s) with a login shell: $SYS_SHELL"
+  REVIEW_ONLY+=("UID<500 non-service account(s) with login shell: $SYS_SHELL")
+fi
+
+log "\n  ${BOLD}Remote logins in wtmp (last 200 sessions):${RESET}"
+REMOTE_LOGINS=$(last -200 2>/dev/null | awk '$2 ~ /^ttys/ && $3 ~ /[.:]/ {print $1" from "$3}' | sort | uniq -c | sort -rn)
+if [ -n "$REMOTE_LOGINS" ]; then
+  echo "$REMOTE_LOGINS" | while IFS= read -r LINE; do log "    ${YELLOW}[REMOTE]${RESET} $LINE session(s)"; done
+  note_mod "Remote (SSH) logins recorded — verify every source host (section 12)"
+else
+  log "    None recorded."
+fi
+
+log "\n  ${BOLD}Home directory permissions:${RESET}"
+HMODE=$(perm_of "$HOME"); HMODE=${HMODE:-0}
+log "    $HOME — $(stat -f '%Su:%Sg %Sp' "$HOME" 2>/dev/null)"
+if [ $(( 8#$HMODE & 7 )) -ne 0 ]; then
+  log "    ${RED}Home is accessible to all users (other bits set). Default is 750/700.${RESET}"
+  REVIEW_ONLY+=("Home directory $HOME has world permissions ($HMODE)")
+fi
+
+# ---- SSH ----
+log "\n  ${BOLD}SSH (keys that grant access IN, keys that grant access OUT):${RESET}"
+SSH_HOMES="$HOME"
+if [ "$IS_ROOT" = true ]; then
+  for UH in /Users/*; do [ "$UH" != "$HOME" ] && [ -d "$UH/.ssh" ] && SSH_HOMES="$SSH_HOMES
+$UH"; done
+fi
+while IFS= read -r SH_HOME; do
+  [ -d "$SH_HOME/.ssh" ] || continue
+  SMODE=$(perm_of "$SH_HOME/.ssh")
+  log "    $SH_HOME/.ssh (mode $SMODE)"
+  [ $(( 8#${SMODE:-0} & 077 )) -ne 0 ] && REVIEW_ONLY+=("$SH_HOME/.ssh is group/world accessible ($SMODE)")
+  AK="$SH_HOME/.ssh/authorized_keys"
+  if [ -s "$AK" ]; then
+    AKN=$(grep -cvE '^\s*#|^\s*$' "$AK" 2>/dev/null)
+    log "      ${YELLOW}[AUTHORIZED_KEYS]${RESET} $AKN key(s) can log in as $(basename "$SH_HOME"):"
+    ssh-keygen -lf "$AK" 2>/dev/null | while IFS= read -r LINE; do log "        $LINE"; done
+    grep -qE '(^|,)command=' "$AK" 2>/dev/null && log "        (some keys carry forced command= options)"
+    note_mod "$AKN authorized SSH key(s) for $(basename "$SH_HOME") — verify each fingerprint"
+  fi
+  for K in "$SH_HOME"/.ssh/*; do
+    [ -f "$K" ] || continue
+    head -1 "$K" 2>/dev/null | grep -q "PRIVATE KEY" || continue
+    KMODE=$(perm_of "$K")
+    ENC="passphrase-protected"
+    ssh-keygen -y -P "" -f "$K" >/dev/null 2>&1 && ENC="NO PASSPHRASE"
+    log "      [PRIVATE KEY] $(basename "$K") — mode $KMODE — $ENC"
+    [ $(( 8#${KMODE:-0} & 077 )) -ne 0 ] && REVIEW_ONLY+=("SSH private key readable by others: $K ($KMODE)")
+    [ "$ENC" = "NO PASSPHRASE" ] && note_mod "Unencrypted SSH private key: $K (anything running as you can copy and use it)"
+  done
+  if [ -f "$SH_HOME/.ssh/config" ]; then
+    SSHCMD=$(grep -nEi '^\s*(ProxyCommand|LocalCommand|PermitLocalCommand\s+yes|KnownHostsCommand|Match\s+exec)' "$SH_HOME/.ssh/config" 2>/dev/null)
+    if [ -n "$SSHCMD" ]; then
+      echo "$SSHCMD" | while IFS= read -r LINE; do log "      [ssh config runs a command] $LINE"; done
+      note_mod "~/.ssh/config executes local commands (ProxyCommand/LocalCommand/Match exec) — verify"
+    fi
+  fi
+done <<< "$SSH_HOMES"
+
+# ---- plaintext credential stores ----
+log "\n  ${BOLD}Plaintext credential files (should be mode 600 or tighter):${RESET}"
+CRED_FOUND=false
+for CF in .aws/credentials .netrc .git-credentials .npmrc .pypirc .docker/config.json .config/gh/hosts.yml .kube/config .env .pgpass .my.cnf; do
+  F="$HOME/$CF"
+  [ -f "$F" ] || continue
+  case "$CF" in
+    .npmrc)             grep -q '_authToken\|_auth\s*=' "$F" 2>/dev/null || continue ;;
+    .docker/config.json) grep -q '"auth"' "$F" 2>/dev/null || continue ;;
+  esac
+  CRED_FOUND=true
+  CMODE=$(perm_of "$F")
+  if [ $(( 8#${CMODE:-0} & 077 )) -ne 0 ]; then
+    log "    ${RED}[EXPOSED]${RESET} ~/$CF — mode $CMODE (readable by group/others)"
+    REVIEW_ONLY+=("Credential file readable by others: ~/$CF ($CMODE) — chmod 600")
+  else
+    log "    ~/$CF — mode $CMODE"
+  fi
+done
+[ "$CRED_FOUND" = true ] && note_mod "Plaintext credential files present in home (section 12) — prime infostealer targets"
+[ "$CRED_FOUND" = false ] && log "    None found."
+
+# ---- ownership anomalies ----
+# Root-owned files in your home come from `sudo pip/npm/brew` or installers;
+# they can't be updated/removed by you and occasionally hide persistence.
+log "\n  ${BOLD}Items in your home NOT owned by $TARGET_USER:${RESET}"
+FOREIGN=$(
+  find "$HOME" -xdev -maxdepth 3 -path "$HOME/Library" -prune -o ! -user "$TARGET_USER" -print 2>/dev/null
+  find "$HOME/Library" "$HOME/Library/Application Support" "$HOME/Library/LaunchAgents" "$HOME/Library/Preferences" -maxdepth 1 ! -user "$TARGET_USER" 2>/dev/null
+)
+FOREIGN=$(echo "$FOREIGN" | grep -v '^$' | sort -u)
+if [ -n "$FOREIGN" ]; then
+  FN=$(echo "$FOREIGN" | wc -l | tr -d ' ')
+  echo "$FOREIGN" | head -30 | while IFS= read -r FP; do log "    ${YELLOW}[FOREIGN]${RESET} $FP — $(stat -f '%Su:%Sg' "$FP" 2>/dev/null)"; done
+  [ "$FN" -gt 30 ] && log "    … $((FN - 30)) more."
+  REVIEW_ONLY+=("$FN item(s) in your home owned by another user (usually root) — see section 12")
+else
+  log "    None."
+fi
+
+if [ "$IS_ROOT" = true ]; then
+  log "\n  ${BOLD}Other users' shell startup files:${RESET}"
+  OTHER_RC=false
+  for UH in /Users/*; do
+    [ "$UH" = "$HOME" ] || [ "$UH" = "/Users/Shared" ] && continue
+    [ -d "$UH" ] || continue
+    for RC in .zshrc .zprofile .zshenv .zlogin .bashrc .bash_profile .profile; do
+      [ -f "$UH/$RC" ] || continue
+      OTHER_RC=true
+      SUS=$(grep -nE "$SUS_RC_RE" "$UH/$RC" 2>/dev/null)
+      if [ -n "$SUS" ]; then
+        echo "$SUS" | while IFS= read -r LINE; do log "    ${RED}[SUSPICIOUS]${RESET} $UH/$RC: $LINE"; done
+        REVIEW_ONLY+=("Suspicious line(s) in $UH/$RC")
+      fi
+    done
+  done
+  [ "$OTHER_RC" = false ] && log "    No other user homes with rc files."
+fi
+
+# ============================================================
+# [13] APP EXTENSIONS & PLUG-INS
 # ============================================================
 section "APP EXTENSIONS & PLUG-INS (pluginkit, browsers, Library plug-in dirs)"
 
 log "  ${BOLD}Third-party app extensions (pluginkit — Finder sync, share sheets, widgets):${RESET}"
-PK_OUT=$(pluginkit -m 2>/dev/null | grep -v "com\.apple\." | sort)
+PK_OUT=$(as_user pluginkit -m 2>/dev/null | grep -v "com\.apple\." | sort)
 if [ -n "$PK_OUT" ]; then
   echo "$PK_OUT" | while read -r LINE; do log "    $LINE"; done
   note_mod "$(echo "$PK_OUT" | wc -l | tr -d ' ') third-party app extensions registered (pluginkit)"
@@ -847,7 +1609,7 @@ if [ -d "$HOME/Library/Application Support/Firefox/Profiles" ]; then
   done < <(find "$HOME/Library/Application Support/Firefox/Profiles" -maxdepth 3 -name "*.xpi" -path "*/extensions/*" 2>/dev/null)
 fi
 # Safari: extensions register through pluginkit.
-SAFARI_EXT=$(pluginkit -m -p com.apple.Safari.web-extension -p com.apple.Safari.extension 2>/dev/null | grep -v "com\.apple\." | sort)
+SAFARI_EXT=$(as_user pluginkit -m -p com.apple.Safari.web-extension -p com.apple.Safari.extension 2>/dev/null | grep -v "com\.apple\." | sort)
 if [ -n "$SAFARI_EXT" ]; then
   echo "$SAFARI_EXT" | while read -r LINE; do log "    [Safari] $LINE"; done
 fi
@@ -861,7 +1623,10 @@ log "    (Browser extensions run with access to page content — the most common
 log "\n  ${BOLD}Library plug-in directories (both domains — anything listed is third-party):${RESET}"
 PLUGDIR_FOUND=false
 for BASE in "$HOME/Library" "/Library"; do
-  for SUB in "QuickLook" "PreferencePanes" "Spotlight" "Internet Plug-Ins" "Mail/Bundles" "Audio/Plug-Ins/HAL" "Audio/Plug-Ins/Components" "Services" "Input Methods" "ColorPickers"; do
+  for SUB in "QuickLook" "PreferencePanes" "Spotlight" "Internet Plug-Ins" "Mail/Bundles" "Audio/Plug-Ins/HAL" "Audio/Plug-Ins/Components" "Audio/MIDI Drivers" "Services" "Input Methods" "ColorPickers" \
+             "Frameworks" "Filesystems" "Screen Savers" "Components" "Contextual Menu Items" "Automator" "Widgets" "Keyboard Layouts" "CoreMediaIO/Plug-Ins/DAL" "Image Capture/Devices" "Scripting Additions" "DriverExtensions" "Extensions"; do
+    # /Library/Extensions is covered with kexts in section 10.
+    [ "$BASE/$SUB" = "/Library/Extensions" ] && continue
     D="$BASE/$SUB"
     [ -d "$D" ] || continue
     CONTENTS=$(ls -A "$D" 2>/dev/null)
@@ -875,7 +1640,112 @@ done
 [ "$PLUGDIR_FOUND" = false ] && log "    All empty — no third-party plug-ins."
 
 # ============================================================
-# [12] NETWORK CONFIGURATION MODIFICATIONS
+# [14] LIBRARY LEFTOVERS (added 2026-09)
+# ============================================================
+section "LIBRARY LEFTOVERS (data of apps that are no longer installed)"
+log "  Dragging an app to the Trash leaves its sandbox container, saved window"
+log "  state and prefs behind. Orphans are matched by bundle ID against every"
+log "  installed app/extension, then double-checked with Spotlight.\n"
+
+INSTALLED_IDS="$AUDIT_DIR/.installed_ids.$$"
+: > "$INSTALLED_IDS"
+while IFS= read -r APP; do
+  /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" 2>/dev/null >> "$INSTALLED_IDS"
+  # iOS/iPadOS apps on Apple Silicon keep Info.plist in the wrapped bundle.
+  for W in "$APP"/Wrapper/*.app; do
+    [ -f "$W/Info.plist" ] && /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$W/Info.plist" 2>/dev/null >> "$INSTALLED_IDS"
+  done
+  # Nested helpers/extensions own containers too and often don't share the
+  # parent's ID prefix (com.foo.app vs com.foo.helper).
+  for N in "$APP"/Contents/{PlugIns,Extensions,Helpers,XPCServices,Library/LoginItems,Library/LaunchServices}/*.{app,appex,xpc}; do
+    [ -f "$N/Contents/Info.plist" ] && /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$N/Contents/Info.plist" 2>/dev/null >> "$INSTALLED_IDS"
+  done
+done < <(find /Applications "$HOME/Applications" /System/Applications /Library/Application\ Support -maxdepth 4 -name "*.app" -prune 2>/dev/null)
+sort -u -o "$INSTALLED_IDS" "$INSTALLED_IDS"
+
+# 0 = installed (exact id, a parent id — e.g. an app extension of an
+# installed app — or found by Spotlight), 1 = orphan.
+id_installed() {
+  local id="$1" p
+  case "$id" in [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9].*) id="${id#*.}" ;; esac  # strip Team ID prefix
+  p="$id"
+  while [ -n "$p" ]; do
+    grep -qxF "$p" "$INSTALLED_IDS" && return 0
+    case "$p" in *.*.*) p="${p%.*}" ;; *) break ;; esac
+  done
+  [ -n "$(mdfind "kMDItemCFBundleIdentifier == '$id'" 2>/dev/null | head -1)" ] && return 0
+  return 1
+}
+
+log "  ${BOLD}Orphaned sandbox containers (~/Library/Containers):${RESET}"
+ORPH_C=0
+while IFS= read -r CID; do
+  case "$CID" in com.apple.*|*-*-*-*-*|"") continue ;; esac   # Apple, UUID-named
+  id_installed "$CID" && continue
+  ORPH_C=$((ORPH_C + 1))
+  CSIZE=""
+  [ "$HAS_FDA" = true ] && CSIZE=" ($(du -sh "$HOME/Library/Containers/$CID" 2>/dev/null | cut -f1))"
+  log "    ${YELLOW}[ORPHAN]${RESET} $CID$CSIZE"
+done < <(ls -A "$HOME/Library/Containers" 2>/dev/null)
+if [ "$ORPH_C" -gt 0 ]; then
+  REVIEW_ONLY+=("$ORPH_C orphaned app container(s) in ~/Library/Containers — may hold data you want; remove via the app's uninstaller or Finder")
+  [ "$HAS_FDA" = false ] && log "    (sizes need Full Disk Access)"
+else
+  log "    None."
+fi
+
+log "\n  ${BOLD}Orphaned Application Scripts (~/Library/Application Scripts):${RESET}"
+ORPH_S=0
+while IFS= read -r SID; do
+  case "$SID" in com.apple.*|"") continue ;; esac
+  id_installed "$SID" && continue
+  ORPH_S=$((ORPH_S + 1))
+  log "    ${YELLOW}[ORPHAN]${RESET} $SID"
+done < <(ls -A "$HOME/Library/Application Scripts" 2>/dev/null)
+[ "$ORPH_S" -eq 0 ] && log "    None."
+[ "$ORPH_S" -gt 0 ] && note_mod "$ORPH_S orphaned Application Scripts folder(s)"
+
+# Saved window state is pure cache — safe to quarantine.
+log "\n  ${BOLD}Orphaned saved window state (~/Library/Saved Application State):${RESET}"
+ORPH_W=0
+while IFS= read -r ST; do
+  SID="${ST%.savedState}"
+  case "$SID" in com.apple.*|"") continue ;; esac
+  id_installed "$SID" && continue
+  ORPH_W=$((ORPH_W + 1))
+  log "    ${YELLOW}[ORPHAN]${RESET} $ST"
+  SAFE_CANDIDATES+=("$HOME/Library/Saved Application State/$ST")
+done < <(ls -A "$HOME/Library/Saved Application State" 2>/dev/null | grep '\.savedState$')
+[ "$ORPH_W" -eq 0 ] && log "    None."
+
+# Preferences are noisy (CLI tools and helpers write them too), so these are
+# informational only — never flagged.
+log "\n  ${BOLD}Preference files with no matching installed app (informational):${RESET}"
+ORPH_P=0
+ORPH_P_LIST=""
+while IFS= read -r PF; do
+  PID="${PF%.plist}"
+  case "$PID" in com.apple.*|.GlobalPreferences*|*ByHost*|loginwindow|"") continue ;; esac
+  case "$PID" in *.*.*) ;; *) continue ;; esac   # only reverse-DNS names
+  id_installed "$PID" && continue
+  ORPH_P=$((ORPH_P + 1))
+  ORPH_P_LIST="$ORPH_P_LIST $PID"
+done < <(ls -A "$HOME/Library/Preferences" 2>/dev/null | grep '\.plist$')
+if [ "$ORPH_P" -gt 0 ]; then
+  log "    $ORPH_P file(s):"
+  for P in $ORPH_P_LIST; do log "      $P"; done
+  note_mod "$ORPH_P preference file(s) without an installed app (leftovers or CLI tools)"
+else
+  log "    None."
+fi
+
+log "\n  ${BOLD}Third-party vendor folders in /Library/Application Support:${RESET}"
+ls -A "/Library/Application Support" 2>/dev/null | grep -vE '^(Apple|\.DS_Store|\.localized|com\.apple\..*|CrashReporter|Script Editor|iLifeMediaBrowser|ProApps|Printers|Logs|DiskImages|com\.apple\.TCC|Mobile Documents)$' | \
+  while IFS= read -r V; do log "    $V ($(du -sh "/Library/Application Support/$V" 2>/dev/null | cut -f1))"; done
+rm -f "$INSTALLED_IDS"
+
+# ============================================================
+# [15] NETWORK CONFIGURATION MODIFICATIONS
 # ============================================================
 section "NETWORK CONFIGURATION (proxies, DNS, VPN, remote-access services)"
 
@@ -906,11 +1776,12 @@ fi
 
 log "\n  ${BOLD}Remote-access & sharing services:${RESET}"
 DISABLED_DUMP=$(launchctl print-disabled system 2>/dev/null)
-for SVC_LABEL in com.openssh.sshd com.apple.screensharing com.apple.smbd; do
+for SVC_LABEL in com.openssh.sshd com.apple.screensharing com.apple.smbd com.apple.AEServer; do
   case "$SVC_LABEL" in
     com.openssh.sshd)        SVC_NAME="Remote Login (SSH)" ;;
     com.apple.screensharing) SVC_NAME="Screen Sharing" ;;
     com.apple.smbd)          SVC_NAME="File Sharing (SMB)" ;;
+    com.apple.AEServer)      SVC_NAME="Remote Apple Events" ;;
   esac
   SVC_LINE=$(echo "$DISABLED_DUMP" | grep "\"$SVC_LABEL\"")
   if echo "$SVC_LINE" | grep -q "false"; then
@@ -923,8 +1794,42 @@ for SVC_LABEL in com.openssh.sshd com.apple.screensharing com.apple.smbd; do
   fi
 done
 
+# Remote Management (ARD) is a superset of Screen Sharing: full remote
+# control plus remote command execution.
+if [ -f "/Library/Application Support/Apple/Remote Desktop/RemoteManagement.launchd" ] || \
+   ps axo comm= 2>/dev/null | grep -q '/ARDAgent$'; then
+  log "    ${YELLOW}[ENABLED]${RESET} Remote Management (ARD) — remote control + remote command execution"
+  note_mod "Remote Management (ARD) enabled"
+else
+  log "    ${GREEN}[disabled]${RESET} Remote Management (ARD)"
+fi
+if defaults read /Library/Preferences/SystemConfiguration/com.apple.nat 2>/dev/null | grep -q 'Enabled = 1'; then
+  log "    ${YELLOW}[ENABLED]${RESET} Internet Sharing — this Mac is routing traffic for other devices"
+  note_mod "Internet Sharing enabled"
+fi
+if cupsctl 2>/dev/null | grep -q '_share_printers=1'; then
+  log "    ${YELLOW}[ENABLED]${RESET} Printer Sharing"
+  note_mod "Printer Sharing enabled"
+fi
+
+log "\n  ${BOLD}Application Firewall rules:${RESET}"
+BLOCKALL=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getblockall 2>/dev/null)
+log "    Block all incoming: $(echo "${BLOCKALL:-unknown}" | sed 's/^ *//' | head -1)"
+SIGNED_OK=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getallowsigned 2>/dev/null | tr '\n' ' ')
+[ -n "$SIGNED_OK" ] && log "    Auto-allow signed software: $SIGNED_OK"
+FW_APPS=$(/usr/libexec/ApplicationFirewall/socketfilterfw --listapps 2>/dev/null | awk '
+  /^[0-9]+ :/ { sub(/^[0-9]+ :[ \t]*/, ""); sub(/[ \t]+$/, ""); app=$0; next }
+  /incoming connections/ { gsub(/[()\t]/, ""); sub(/^ +/, ""); if (app != "") print app " — " $0; app="" }')
+if [ -n "$FW_APPS" ]; then
+  echo "$FW_APPS" | while IFS= read -r LINE; do log "    $LINE"; done
+  FW_ALLOW_N=$(echo "$FW_APPS" | grep -c "Allow" || true)
+  [ "${FW_ALLOW_N:-0}" -gt 0 ] && note_mod "$FW_ALLOW_N app(s) explicitly allowed through the firewall"
+else
+  log "    No per-app rules."
+fi
+
 # ============================================================
-# [13] ACTIVE OUTBOUND CONNECTIONS
+# [16] ACTIVE OUTBOUND CONNECTIONS
 # ============================================================
 section "ACTIVE OUTBOUND CONNECTIONS"
 lsof -i -n -P 2>/dev/null | grep ESTABLISHED | awk '{print $1, $9}' | sort -u | \
@@ -933,15 +1838,80 @@ grep -v "^Google\|^Slack\|^Zoom\|rapportd\|identitys" | while read -r LINE; do
 done
 
 # ============================================================
-# [14] DISK USAGE
+# [17] DISK USAGE
 # ============================================================
 section "DISK USAGE — LARGEST ITEMS"
 
 log "\n  Top 15 largest items under \$HOME (excluding ~/Library to keep this fast):"
 # -print0/xargs -0: safe for any filename (spaces, quotes, newlines).
-find "$HOME" -mindepth 1 -maxdepth 2 -not -path "$HOME/Library*" -print0 2>/dev/null | \
-xargs -0 du -sh 2>/dev/null | sort -rh | head -15 | while read -r LINE; do log "    $LINE"; done
+find "$HOME" -mindepth 1 -maxdepth 2 -not -path "$HOME/Library*" -exec du -sh {} + 2>/dev/null | sort -rh | head -15 | while read -r LINE; do log "    $LINE"; done
 
+log "\n  ${BOLD}Volume:${RESET}"
+df -h /System/Volumes/Data 2>/dev/null | tail -1 | awk '{print "    Data volume: "$3" used of "$2" ("$5"), "$4" free"}' | while IFS= read -r LINE; do log "$LINE"; done
+SNAPS=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple' || true)
+[ "${SNAPS:-0}" -gt 0 ] && log "    Time Machine local snapshots: $SNAPS (purgeable; macOS frees them under pressure)"
+SWAP=$(sysctl -n vm.swapusage 2>/dev/null)
+[ -n "$SWAP" ] && log "    Swap: $SWAP"
+
+# ~/Library is usually the biggest hidden consumer. Without Full Disk Access
+# du can't enter protected folders (Mail, Messages, Containers…) and may
+# trigger TCC prompts, so only the unprotected ones are sized then.
+log "\n  ${BOLD}~/Library — largest subfolders:${RESET}"
+if [ "$HAS_FDA" = true ]; then
+  find "$HOME/Library" -mindepth 1 -maxdepth 1 -exec du -sh {} + 2>/dev/null | sort -rh | head -12 | \
+    while IFS= read -r LINE; do log "    $LINE"; done
+  log "\n  ${BOLD}~/Library/Application Support + Containers + Group Containers — largest:${RESET}"
+  find "$HOME/Library/Application Support" "$HOME/Library/Containers" "$HOME/Library/Group Containers" -mindepth 1 -maxdepth 1 -exec du -sh {} + 2>/dev/null | sort -rh | head -15 | while IFS= read -r LINE; do log "    $LINE"; done
+else
+  for LD in Caches Logs Developer "Application Support" Android; do
+    [ -d "$HOME/Library/$LD" ] || continue
+    log "    $(du -sh "$HOME/Library/$LD" 2>/dev/null | cut -f1)	~/Library/$LD"
+  done
+  log "    (Grant Terminal Full Disk Access for the full ~/Library + Containers breakdown.)"
+fi
+
+log "\n  ${BOLD}/Library — largest subfolders:${RESET}"
+find /Library -mindepth 1 -maxdepth 1 -exec du -sh {} + 2>/dev/null | sort -rh | head -8 | \
+  while IFS= read -r LINE; do log "    $LINE"; done
+
+# Regenerable developer / package-manager caches: rebuilt on demand, so
+# they're quarantine-eligible. Anything that holds unique data is excluded.
+log "\n  ${BOLD}Regenerable developer caches:${RESET}"
+DEVCACHE_FOUND=false
+for DC in "$HOME/Library/Developer/Xcode/DerivedData" \
+          "$HOME/Library/Developer/Xcode/iOS DeviceSupport" \
+          "$HOME/Library/Developer/Xcode/watchOS DeviceSupport" \
+          "$HOME/Library/Developer/CoreSimulator/Caches" \
+          "$HOME/.npm/_cacache" "$HOME/.cache/pip" "$HOME/.gradle/caches" \
+          "$HOME/Library/Caches/Yarn" "$HOME/.cache/huggingface/xet"; do
+  [ -d "$DC" ] || continue
+  DSZ=$(du -sh "$DC" 2>/dev/null | cut -f1)
+  DEVCACHE_FOUND=true
+  log "    $DSZ	$DC"
+  case "$DC" in "$HOME/Library/Caches/"*) ;; *) SAFE_CANDIDATES+=("$DC") ;; esac  # ~/Library/Caches is already a candidate
+done
+[ "$DEVCACHE_FOUND" = false ] && log "    None."
+# Big but NOT disposable — reported so you know where the space went.
+for BIG in "$HOME/Library/Developer/CoreSimulator/Devices" "$HOME/Library/Application Support/MobileSync/Backup" \
+           "$HOME/.ollama/models" "$HOME/.cache/huggingface/hub" "$HOME/.lmstudio/models" "$HOME/Library/Containers/com.docker.docker"; do
+  [ -d "$BIG" ] || continue
+  BSZ=$(du -sh "$BIG" 2>/dev/null | cut -f1)
+  [ -n "$BSZ" ] && log "    $BSZ	$BIG  (not auto-flagged: holds data — prune from the owning app)"
+done
+
+log "\n  ${BOLD}Files larger than 1 GB under \$HOME:${RESET}"
+if [ "$HAS_FDA" = true ]; then
+  BIGF=$(find "$HOME" -xdev -type f -size +1G -exec du -h {} + 2>/dev/null | sort -rh | head -20)
+else
+  BIGF=$(find "$HOME" -xdev \( -path "$HOME/Library/Containers" -o -path "$HOME/Library/Group Containers" -o -path "$HOME/Library/Mail" -o -path "$HOME/Library/Messages" \) -prune -o -type f -size +1G -exec du -h {} + 2>/dev/null | sort -rh | head -20)
+fi
+if [ -n "$BIGF" ]; then
+  echo "$BIGF" | while IFS= read -r LINE; do log "    $LINE"; done
+else
+  log "    None."
+fi
+
+log ""
 for CACHE in "$HOME/Library/Caches" "$HOME/Library/Logs" "$HOME/.Trash"; do
   if [ -d "$CACHE" ]; then
     SIZE=$(du -sh "$CACHE" 2>/dev/null | cut -f1)
@@ -951,10 +1921,9 @@ for CACHE in "$HOME/Library/Caches" "$HOME/Library/Logs" "$HOME/.Trash"; do
 done
 
 # ============================================================
-# [15] SUMMARY & QUARANTINE OFFER
+# [18] SUMMARY & QUARANTINE OFFER
 # ============================================================
-section "SUMMARY"
-md_close_fence
+section "SUMMARY" nofence
 
 logt "\n  ${BOLD}For manual review (security-relevant, never auto-removed):${RESET}"
 md ""
