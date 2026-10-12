@@ -2,6 +2,10 @@
 #
 # package_updater.sh
 #
+# Usage (from projects/mac-scripts/scripts):
+#   bash package_updater.sh                       # with network security check
+#   bash package_updater.sh --skip-network-check  # without network check
+#
 # Standalone updater: only runs brew/pip/npm updates when the current
 # network connection is judged "secure" (VPN active, a trusted Wi-Fi
 # SSID, or a wired/non-Wi-Fi connection). No sudo. No dependency on
@@ -31,6 +35,32 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() {
     echo "${LOG_PREFIX} $(date '+%Y-%m-%d %H:%M:%S') - $*"
+}
+
+# Non-interactive / no-surprise settings so nothing stops to ask or phone home.
+export HOMEBREW_NO_AUTO_UPDATE=1      # we run `brew update` ourselves once
+export HOMEBREW_NO_ENV_HINTS=1
+export NONINTERACTIVE=1
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export npm_config_update_notifier=false
+export npm_config_fund=false
+export npm_config_audit=false
+
+# Per-step time limit in seconds (override: STEP_TIMEOUT=1800 bash package_updater.sh).
+STEP_TIMEOUT="${STEP_TIMEOUT:-900}"
+
+# run_step SECONDS CMD...  -- run CMD with stdin closed and a hard time limit.
+# macOS has no `timeout`, so use perl's alarm (exec keeps the alarm armed).
+# Returns 124 on timeout.
+run_step() {
+    local secs=$1; shift
+    perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' "$secs" "$@" </dev/null
+    local rc=$?
+    if [ "$rc" -eq 142 ] || [ "$rc" -eq 124 ]; then
+        log "TIMED OUT after ${secs}s: $*"
+        return 124
+    fi
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -135,15 +165,15 @@ run_brew_update() {
         return
     fi
 
-    log "Running brew update..."
-    brew update || log "brew update failed, continuing."
+    log "Running brew update (limit ${STEP_TIMEOUT}s)..."
+    run_step "$STEP_TIMEOUT" brew update || log "brew update failed, continuing."
 
     log "Running brew upgrade..."
-    brew upgrade || log "brew upgrade failed, continuing."
+    run_step "$STEP_TIMEOUT" brew upgrade || log "brew upgrade failed, continuing."
 
     if brew list --cask >/dev/null 2>&1 && [ -n "$(brew list --cask 2>/dev/null)" ]; then
         log "Casks present, running brew upgrade --cask..."
-        brew upgrade --cask || log "brew upgrade --cask failed, continuing."
+        run_step "$STEP_TIMEOUT" brew upgrade --cask || log "brew upgrade --cask failed, continuing."
     else
         log "No casks installed, skipping brew upgrade --cask."
     fi
@@ -162,7 +192,7 @@ run_pip_update() {
 
     log "Checking outdated user-level pip packages..."
     local outdated
-    outdated=$("$pip_cmd" list --user --outdated --format=freeze 2>/dev/null | cut -d'=' -f1)
+    outdated=$(run_step 120 "$pip_cmd" list --user --outdated --format=freeze --timeout 15 2>/dev/null | cut -d'=' -f1)
 
     if [ -z "$outdated" ]; then
         log "No outdated user-level pip packages."
@@ -172,7 +202,7 @@ run_pip_update() {
     local pkg
     for pkg in $outdated; do
         log "Upgrading pip package (user): $pkg"
-        if ! "$pip_cmd" install --user --upgrade "$pkg"; then
+        if ! run_step 300 "$pip_cmd" install --user --upgrade --timeout 15 "$pkg"; then
             log "Failed to upgrade $pkg, continuing. (If the error mentions an 'externally-managed environment', this Python is Homebrew/PEP 668 managed — manage that package with brew or pipx instead.)"
         fi
     done
@@ -185,10 +215,10 @@ run_npm_update() {
     fi
 
     log "Checking outdated global npm packages..."
-    npm outdated -g || true
+    run_step 120 npm outdated -g || true
 
     log "Running npm update -g..."
-    npm update -g || log "npm update -g failed, continuing."
+    run_step "$STEP_TIMEOUT" npm update -g || log "npm update -g failed, continuing."
 }
 
 # ---------------------------------------------------------------------------
